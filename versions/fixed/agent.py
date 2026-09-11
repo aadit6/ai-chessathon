@@ -9,6 +9,7 @@ rook files, the bishop pair, king shelter and tempo.
 """
 
 import math
+import os
 import time
 from collections.abc import Hashable
 from operator import itemgetter
@@ -27,6 +28,7 @@ LOW_CLOCK_MS = 25_000
 LOW_DIVISOR = 45.0
 
 MAX_DEPTH = 64
+FIXED_DEPTH = int(os.environ.get('FIXED_DEPTH', '6'))
 MAX_PLY = 96
 INF = 40_000
 MATE = 32_000
@@ -406,8 +408,7 @@ class Searcher:
             best_move, best_score, completed = move, score, depth
             moves.remove(move)
             moves.insert(0, move)
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            if abs(score) >= MATE_BOUND or elapsed_ms > optimum_ms * 0.6:
+            if abs(score) >= MATE_BOUND or depth >= FIXED_DEPTH:
                 break
             depth += 1
 

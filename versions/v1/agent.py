@@ -8,7 +8,6 @@ Evaluation: material and piece-square tables tapered by game phase, plus pawn st
 rook files, the bishop pair, king shelter and tempo.
 """
 
-import math
 import time
 from collections.abc import Hashable
 from operator import itemgetter
@@ -19,12 +18,6 @@ CONTRACT_INCREMENT_MS = 500
 RESERVE_MS = 250  # the referee's watchdog grace and pipe latency
 PANIC_MS = 400
 NODE_CHECK_MASK = 1023
-# A rated game ran 69 moves and ended with 10 s left, so the clock is spread wider than the
-# ~30 moves a middlegame position suggests, and the increment is only mostly spent.
-MOVE_DIVISOR = 34.0
-INCREMENT_SHARE = 0.85
-LOW_CLOCK_MS = 25_000
-LOW_DIVISOR = 45.0
 
 MAX_DEPTH = 64
 MAX_PLY = 96
@@ -37,21 +30,6 @@ EXACT, LOWER, UPPER = 0, 1, 2
 ASPIRATION = 40
 DELTA_MARGIN = 150
 LMR_FROM_MOVE = 3
-RFP_DEPTH = 6
-RFP_MARGIN = 85
-FUTILITY_DEPTH = 4
-FUTILITY_MARGIN = 110
-IID_DEPTH = 5
-LMP_DEPTH = 5
-LMP_COUNT = (0, 6, 10, 16, 24, 34)
-
-# Reduce late quiet moves harder the deeper the node and the further down the move list, rather
-# than by the flat one-or-two plies a hand-written rule gives.
-LMR_TABLE = [
-    [0 if depth == 0 or index == 0 else int(0.75 + math.log(depth) * math.log(index) / 2.25)
-     for index in range(64)]
-    for depth in range(64)
-]
 
 TTEntry = tuple[int, int, int, chess.Move | None]
 
@@ -190,6 +168,7 @@ ADJACENT_FILES, PASSED_W, PASSED_B, SHIELD_NEAR_W, SHIELD_FAR_W, SHIELD_NEAR_B, 
     _masks()
 )
 
+
 def evaluate(board: chess.Board) -> int:
     """Static evaluation in centipawns from the side to move's point of view."""
     white = board.occupied_co[chess.WHITE]
@@ -306,60 +285,6 @@ def _has_pieces(board: chess.Board) -> bool:
     return bool(board.occupied_co[board.turn] & ~(board.pawns | board.kings))
 
 
-SEE_VALUES = (0, 100, 320, 330, 500, 900, 20_000)
-
-
-def see(board: chess.Board, move: chess.Move) -> int:
-    """Net centipawns from playing out the whole exchange on the target square.
-
-    MVV-LVA alone ranks a queen taking a defended pawn as a fine capture. This plays the
-    swap-off out, recomputing attackers against a shrinking occupancy so pieces behind the
-    ones that just traded off join the exchange.
-    """
-    target = move.to_square
-    if board.is_en_passant(move):
-        captured_value = SEE_VALUES[chess.PAWN]
-    else:
-        victim = board.piece_type_at(target)
-        captured_value = SEE_VALUES[victim] if victim else 0
-    attacker = board.piece_type_at(move.from_square)
-    if attacker is None:
-        return 0
-
-    occupied = board.occupied & ~chess.BB_SQUARES[move.from_square]
-    if board.is_en_passant(move) and board.ep_square is not None:
-        behind = board.ep_square + (-8 if board.turn == chess.WHITE else 8)
-        occupied &= ~chess.BB_SQUARES[behind]
-
-    gains = [captured_value]
-    on_square = SEE_VALUES[attacker]
-    side = not board.turn
-    while True:
-        attackers = board.attackers_mask(side, target, occupied) & occupied
-        if not attackers:
-            break
-        square = -1
-        value = 0
-        for piece_type in range(chess.PAWN, chess.KING + 1):
-            subset = attackers & board.pieces_mask(piece_type, side)
-            if subset:
-                square = chess.lsb(subset)
-                value = SEE_VALUES[piece_type]
-                break
-        if square < 0:
-            break
-        gains.append(on_square - gains[-1])
-        if max(-gains[-2], gains[-1]) < 0:
-            break
-        on_square = value
-        occupied &= ~chess.BB_SQUARES[square]
-        side = not side
-
-    for index in range(len(gains) - 1, 0, -1):
-        gains[index - 1] = -max(-gains[index - 1], gains[index])
-    return gains[0]
-
-
 class Searcher:
     def __init__(self) -> None:
         self.table: dict[Hashable, TTEntry] = {}
@@ -458,12 +383,6 @@ class Searcher:
         if self.path.get(key) or self.seen.get(key):
             return DRAW
 
-        # Mate distance: a faster mate is already available above, so nothing here can matter.
-        alpha = max(alpha, -MATE + ply)
-        beta = min(beta, MATE - ply - 1)
-        if alpha >= beta:
-            return alpha
-
         in_check = board.is_check()
         if in_check:
             depth += 1
@@ -486,32 +405,13 @@ class Searcher:
                     return score
 
         pv_node = beta - alpha > 1
-        # Internal iterative deepening: with no hash move, a shallow search is cheaper than
-        # searching this node in a bad order.
-        if table_move is None and pv_node and depth >= IID_DEPTH:
-            self.search(board, depth - 2, alpha, beta, ply, False)
-            probe = self.table.get(key)
-            if probe is not None:
-                table_move = probe[3]
-        static = 0 if in_check else evaluate(board)
-
-        # Reverse futility: so far ahead that handing back a piece a ply would still hold beta.
-        if (
-            not pv_node
-            and not in_check
-            and depth <= RFP_DEPTH
-            and abs(beta) < MATE_BOUND
-            and static - RFP_MARGIN * depth >= beta
-        ):
-            return static
-
         if (
             allow_null
             and not pv_node
             and not in_check
             and depth >= 3
             and _has_pieces(board)
-            and static >= beta
+            and evaluate(board) >= beta
         ):
             board.push(chess.Move.null())
             reduced = depth - 2 - depth // 6
@@ -530,37 +430,19 @@ class Searcher:
         original_alpha = alpha
         best = -INF
         best_move: chess.Move | None = None
-        shallow = not pv_node and not in_check
-        # Quiet moves at a shallow node this far below alpha are not going to lift it.
-        futile = shallow and depth <= FUTILITY_DEPTH and static + FUTILITY_MARGIN * depth <= alpha
-        late_from = LMP_COUNT[depth] if shallow and depth <= LMP_DEPTH else 1 << 30
         try:
             for index, move in enumerate(moves):
                 quiet = move.promotion is None and not board.is_capture(move)
                 board.push(move)
                 try:
                     gives_check = board.is_check()
-                    if (
-                        index > 0
-                        and quiet
-                        and not gives_check
-                        and best > -MATE_BOUND
-                        and (futile or index >= late_from)
-                    ):
-                        continue
                     next_depth = depth - 1
                     if index == 0:
                         score = -self.search(board, next_depth, -beta, -alpha, ply + 1, True)
                     else:
                         reduction = 0
                         if quiet and depth >= 3 and index >= LMR_FROM_MOVE and not in_check:
-                            if gives_check:
-                                reduction = 0
-                            else:
-                                reduction = LMR_TABLE[min(depth, 63)][min(index, 63)]
-                                if pv_node:
-                                    reduction -= 1
-                                reduction = max(0, min(reduction, depth - 2))
+                            reduction = 0 if gives_check else 1 + (index >= 6)
                         score = -self.search(
                             board, next_depth - reduction, -alpha - 1, -alpha, ply + 1, True
                         )
@@ -592,10 +474,7 @@ class Searcher:
             flag = EXACT
         if len(self.table) >= TT_MAX_ENTRIES:
             self.table.clear()
-        # Depth-preferred: a shallow result must not evict the deep one it was cheaper to get.
-        existing = self.table.get(key)
-        if existing is None or depth >= existing[0] or flag == EXACT:
-            self.table[key] = (depth, flag, _to_table(best, ply), best_move)
+        self.table[key] = (depth, flag, _to_table(best, ply), best_move)
         return best
 
     def quiesce(self, board: chess.Board, alpha: int, beta: int, ply: int) -> int:
@@ -661,17 +540,12 @@ class Searcher:
             promotion = PIECE_VALUES[move.promotion] if move.promotion is not None else 0
             if victim is not None:
                 attacker = board.piece_type_at(move.from_square) or 0
-                rank = 10 * PIECE_VALUES[victim] - ATTACKER_VALUES[attacker] + promotion
-                # Trading up needs no proof; only a capture that looks to lose material is
-                # worth paying for a swap-off to check.
-                if PIECE_VALUES[victim] >= PIECE_VALUES[attacker] or see(board, move) >= 0:
-                    return 300_000 + rank
-                return 100_000 + rank
+                return 100_000 + 10 * PIECE_VALUES[victim] - ATTACKER_VALUES[attacker] + promotion
             if promotion:
-                return 290_000 + promotion
+                return 90_000 + promotion
             if move in killers:
-                return 200_000
-            return min(history[base + move.from_square * 64 + move.to_square], 99_000)
+                return 80_000
+            return history[base + move.from_square * 64 + move.to_square]
 
         moves = list(board.legal_moves)
         moves.sort(key=priority, reverse=True)
@@ -684,9 +558,6 @@ class Searcher:
             victim = board.piece_type_at(move.to_square) or chess.PAWN
             attacker = board.piece_type_at(move.from_square) or 0
             gain = PIECE_VALUES[victim]
-            # A capture that loses material has nothing to settle, so it buys no accuracy here.
-            if PIECE_VALUES[victim] < PIECE_VALUES[attacker] and see(board, move) < 0:
-                continue
             scored.append((10 * gain - ATTACKER_VALUES[attacker], gain, move))
         own_pawns = board.pawns & board.occupied_co[board.turn]
         seventh = chess.BB_RANK_7 if board.turn else chess.BB_RANK_2
@@ -730,10 +601,8 @@ class Clock:
         remaining = time_left_ms - RESERVE_MS
         if remaining < PANIC_MS:
             return None
-        divisor = MOVE_DIVISOR if remaining > LOW_CLOCK_MS else LOW_DIVISOR
-        earned = min(self.increment_ms * INCREMENT_SHARE, remaining / 20.0)
-        optimum = remaining / divisor + earned
-        maximum = min(optimum * 2.6, remaining / 5.0)
+        optimum = remaining / 30.0 + min(self.increment_ms, remaining / 20.0)
+        maximum = min(optimum * 3.0, remaining / 5.0)
         return optimum, maximum
 
     def finish(self, started: float) -> None:

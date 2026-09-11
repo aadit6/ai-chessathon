@@ -8,7 +8,6 @@ Evaluation: material and piece-square tables tapered by game phase, plus pawn st
 rook files, the bishop pair, king shelter and tempo.
 """
 
-import math
 import time
 from collections.abc import Hashable
 from operator import itemgetter
@@ -37,21 +36,6 @@ EXACT, LOWER, UPPER = 0, 1, 2
 ASPIRATION = 40
 DELTA_MARGIN = 150
 LMR_FROM_MOVE = 3
-RFP_DEPTH = 6
-RFP_MARGIN = 85
-FUTILITY_DEPTH = 4
-FUTILITY_MARGIN = 110
-IID_DEPTH = 5
-LMP_DEPTH = 5
-LMP_COUNT = (0, 6, 10, 16, 24, 34)
-
-# Reduce late quiet moves harder the deeper the node and the further down the move list, rather
-# than by the flat one-or-two plies a hand-written rule gives.
-LMR_TABLE = [
-    [0 if depth == 0 or index == 0 else int(0.75 + math.log(depth) * math.log(index) / 2.25)
-     for index in range(64)]
-    for depth in range(64)
-]
 
 TTEntry = tuple[int, int, int, chess.Move | None]
 
@@ -189,6 +173,39 @@ def _masks() -> tuple[list[int], ...]:
 ADJACENT_FILES, PASSED_W, PASSED_B, SHIELD_NEAR_W, SHIELD_FAR_W, SHIELD_NEAR_B, SHIELD_FAR_B = (
     _masks()
 )
+
+KING_ZONE = [chess.BB_KING_ATTACKS[square] | chess.BB_SQUARES[square] for square in range(64)]
+DANGER_CAP = 600
+
+
+def king_danger(board: chess.Board, attacker: chess.Color, zone: int) -> int:
+    """How hard `attacker`'s pieces are leaning on the squares around the defender's king.
+
+    Pawn shelter alone cannot see an attack coming, which is how a king walks to f8 and gets
+    mated while the evaluation still reads about level. One attacker is usually noise, so the
+    score only opens up once a second piece joins.
+    """
+    units = 0
+    joined = 0
+    for square in chess.scan_forward(
+        board.occupied_co[attacker] & ~(board.pawns | board.kings)
+    ):
+        hits = (board.attacks_mask(square) & zone).bit_count()
+        if not hits:
+            continue
+        piece = chess.BB_SQUARES[square]
+        if piece & board.queens:
+            weight = 80
+        elif piece & board.rooks:
+            weight = 40
+        else:
+            weight = 20
+        units += weight * hits
+        joined += 1
+    if joined < 2:
+        return 0
+    return min(units * (joined - 1) // 3, DANGER_CAP)
+
 
 def evaluate(board: chess.Board) -> int:
     """Static evaluation in centipawns from the side to move's point of view."""
@@ -458,12 +475,6 @@ class Searcher:
         if self.path.get(key) or self.seen.get(key):
             return DRAW
 
-        # Mate distance: a faster mate is already available above, so nothing here can matter.
-        alpha = max(alpha, -MATE + ply)
-        beta = min(beta, MATE - ply - 1)
-        if alpha >= beta:
-            return alpha
-
         in_check = board.is_check()
         if in_check:
             depth += 1
@@ -486,32 +497,13 @@ class Searcher:
                     return score
 
         pv_node = beta - alpha > 1
-        # Internal iterative deepening: with no hash move, a shallow search is cheaper than
-        # searching this node in a bad order.
-        if table_move is None and pv_node and depth >= IID_DEPTH:
-            self.search(board, depth - 2, alpha, beta, ply, False)
-            probe = self.table.get(key)
-            if probe is not None:
-                table_move = probe[3]
-        static = 0 if in_check else evaluate(board)
-
-        # Reverse futility: so far ahead that handing back a piece a ply would still hold beta.
-        if (
-            not pv_node
-            and not in_check
-            and depth <= RFP_DEPTH
-            and abs(beta) < MATE_BOUND
-            and static - RFP_MARGIN * depth >= beta
-        ):
-            return static
-
         if (
             allow_null
             and not pv_node
             and not in_check
             and depth >= 3
             and _has_pieces(board)
-            and static >= beta
+            and evaluate(board) >= beta
         ):
             board.push(chess.Move.null())
             reduced = depth - 2 - depth // 6
@@ -530,37 +522,19 @@ class Searcher:
         original_alpha = alpha
         best = -INF
         best_move: chess.Move | None = None
-        shallow = not pv_node and not in_check
-        # Quiet moves at a shallow node this far below alpha are not going to lift it.
-        futile = shallow and depth <= FUTILITY_DEPTH and static + FUTILITY_MARGIN * depth <= alpha
-        late_from = LMP_COUNT[depth] if shallow and depth <= LMP_DEPTH else 1 << 30
         try:
             for index, move in enumerate(moves):
                 quiet = move.promotion is None and not board.is_capture(move)
                 board.push(move)
                 try:
                     gives_check = board.is_check()
-                    if (
-                        index > 0
-                        and quiet
-                        and not gives_check
-                        and best > -MATE_BOUND
-                        and (futile or index >= late_from)
-                    ):
-                        continue
                     next_depth = depth - 1
                     if index == 0:
                         score = -self.search(board, next_depth, -beta, -alpha, ply + 1, True)
                     else:
                         reduction = 0
                         if quiet and depth >= 3 and index >= LMR_FROM_MOVE and not in_check:
-                            if gives_check:
-                                reduction = 0
-                            else:
-                                reduction = LMR_TABLE[min(depth, 63)][min(index, 63)]
-                                if pv_node:
-                                    reduction -= 1
-                                reduction = max(0, min(reduction, depth - 2))
+                            reduction = 0 if gives_check else 1 + (index >= 6)
                         score = -self.search(
                             board, next_depth - reduction, -alpha - 1, -alpha, ply + 1, True
                         )
@@ -592,10 +566,7 @@ class Searcher:
             flag = EXACT
         if len(self.table) >= TT_MAX_ENTRIES:
             self.table.clear()
-        # Depth-preferred: a shallow result must not evict the deep one it was cheaper to get.
-        existing = self.table.get(key)
-        if existing is None or depth >= existing[0] or flag == EXACT:
-            self.table[key] = (depth, flag, _to_table(best, ply), best_move)
+        self.table[key] = (depth, flag, _to_table(best, ply), best_move)
         return best
 
     def quiesce(self, board: chess.Board, alpha: int, beta: int, ply: int) -> int:

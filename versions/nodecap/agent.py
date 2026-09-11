@@ -9,6 +9,7 @@ rook files, the bishop pair, king shelter and tempo.
 """
 
 import math
+import os
 import time
 from collections.abc import Hashable
 from operator import itemgetter
@@ -19,6 +20,7 @@ CONTRACT_INCREMENT_MS = 500
 RESERVE_MS = 250  # the referee's watchdog grace and pipe latency
 PANIC_MS = 400
 NODE_CHECK_MASK = 1023
+NODE_LIMIT = int(os.environ.get('NODE_LIMIT', '0'))
 # A rated game ran 69 moves and ended with 10 s left, so the clock is spread wider than the
 # ~30 moves a middlegame position suggests, and the increment is only mostly spent.
 MOVE_DIVISOR = 34.0
@@ -447,6 +449,8 @@ class Searcher:
         self, board: chess.Board, depth: int, alpha: int, beta: int, ply: int, allow_null: bool
     ) -> int:
         self.nodes += 1
+        if NODE_LIMIT and self.nodes >= NODE_LIMIT:
+            raise SearchTimeout
         if not self.nodes & NODE_CHECK_MASK and time.perf_counter() > self.deadline:
             raise SearchTimeout
 

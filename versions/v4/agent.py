@@ -41,7 +41,6 @@ RFP_DEPTH = 6
 RFP_MARGIN = 85
 FUTILITY_DEPTH = 4
 FUTILITY_MARGIN = 110
-IID_DEPTH = 5
 LMP_DEPTH = 5
 LMP_COUNT = (0, 6, 10, 16, 24, 34)
 
@@ -486,13 +485,6 @@ class Searcher:
                     return score
 
         pv_node = beta - alpha > 1
-        # Internal iterative deepening: with no hash move, a shallow search is cheaper than
-        # searching this node in a bad order.
-        if table_move is None and pv_node and depth >= IID_DEPTH:
-            self.search(board, depth - 2, alpha, beta, ply, False)
-            probe = self.table.get(key)
-            if probe is not None:
-                table_move = probe[3]
         static = 0 if in_check else evaluate(board)
 
         # Reverse futility: so far ahead that handing back a piece a ply would still hold beta.
